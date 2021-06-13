@@ -1,0 +1,200 @@
+import gspread
+import pandas as pd
+import numpy as np
+import datetime as dt
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from gspread_formatting.dataframe import format_with_dataframe
+
+gc = gspread.oauth()
+
+#Получаем данные из каждой таблицы worksheet и записываем в отдельный датафрейм
+sh = gc.open_by_key('1Ycg7zTxds9DZnDvTrFcyNNKuTUxg6Yy6WF0a8Wc02WQ')
+worksheet = sh.worksheet("transactions")
+df_transactions = pd.DataFrame(worksheet.get_all_records())
+df_transactions['date'] = pd.to_datetime(df_transactions['created_at'], format='%Y-%m-%d').dt.date
+
+worksheet = sh.worksheet("clients")
+df_clients = pd.DataFrame(worksheet.get_all_records())
+
+worksheet = sh.worksheet("managers")
+df_managers = pd.DataFrame(worksheet.get_all_records())
+
+worksheet = sh.worksheet("leads")
+df_leads = pd.DataFrame(worksheet.get_all_records())
+df_leads['date'] = pd.to_datetime(df_leads['created_at'], format='%Y-%m-%d').dt.date
+
+sh_out = gc.create('MacBuildServerV1')
+sh_out.share('mvakhmenin@gmail.com', perm_type='user', role='writer')
+
+#Создаем датасеты за период отчета
+#Создаем датасеты за предшествующие периоды
+start_date = dt.date(year=2020, month=10, day=15)
+duration = dt.timedelta(days=30)
+finish_date = start_date + duration
+
+df_transactions_curr = df_transactions[(df_transactions['date'] >= start_date) & (df_transactions['date'] <= finish_date)]
+df_transactions_prev = df_transactions[df_transactions['date'] < start_date]
+df_transactions_curr = df_transactions_curr.sort_values(by='date')
+df_transactions_prev = df_transactions_prev.sort_values(by='date')
+
+df_leads_curr = df_leads[(df_leads['date'] >= start_date) & (df_leads['date'] <= finish_date)]
+df_leads_prev = df_leads[df_leads['date'] < start_date]
+df_leads_curr = df_leads_curr.sort_values(by='date')
+df_leads_prev = df_leads_prev.sort_values(by='date')
+
+#Часть идентификаторов менеджеров из таблицы leads отсутствует в таблице managers, поэтому дополняем датафрейм с менеджерами отсутсвующими значениями
+for i in df_leads['l_manager_id'].unique():
+    if i not in df_managers['manager_id'].values:
+        new_manager_name_dict = {'manager_id': i, 'd_manager': 'Неизвестный менеджер', 'd_club': 'Неизвестный клуб'}
+        new_manager_name = pd.DataFrame(data=new_manager_name_dict, index=[1])
+        df_managers = df_managers.append(new_manager_name, ignore_index=True)
+        
+#Формируем датафрейм для отчета
+df_report = pd.DataFrame()
+
+df_report['d_utm_source'] = df_leads_curr['d_utm_source']
+df_report['l_manager_id'] = df_leads_curr['l_manager_id']
+df_report['lead_id'] = df_leads_curr['lead_id']
+df_report['l_client_id'] = df_leads_curr['l_client_id']
+df_report['date'] = df_leads_curr['date']
+
+df_report['d_utm_source'] = df_report['d_utm_source'].replace('insta', 'instagram')
+df_report['d_utm_source'] = df_report['d_utm_source'].replace('vk', 'vkontakte')
+df_report['d_utm_source'] = df_report['d_utm_source'].replace('ycard#!/tproduct/225696739-1498486363994', 'ycard')
+df_report['d_utm_source'] = df_report['d_utm_source'].replace('', 'Неизвестный канал')
+
+#Подтягиваем к отчету имена менеджеров и клубов
+df_report = df_report.merge(df_managers, how='left', left_on='l_manager_id', right_on='manager_id')
+
+#Строим отчет по заявкам и отправляем в Google Sheets
+report_pivot = pd.pivot_table(df_report,
+               index=['d_club', 'd_manager'],
+               columns='d_utm_source',
+               values='lead_id',
+               aggfunc='count',
+               fill_value=0,
+               margins=True)
+
+worksheet = sh_out.add_worksheet(title='Количество заявок', rows="100", cols="20")
+set_with_dataframe(worksheet, report_pivot, include_index=True, include_column_header=True)
+format_with_dataframe(worksheet, 
+                      report_pivot,
+                      include_column_header=True,
+                      include_index=True)
+
+#Создаем датафрейм для отчета по мусорным заявкам (код клиента в таблице с заявками не заполнен)
+#Отправляем отчет в Google Sheets
+df_report_garbage = df_report.loc[df_report['l_client_id'] == '00000000-0000-0000-0000-000000000000']
+report_garbage_pivot = pd.pivot_table(df_report_garbage,
+               index=['d_club', 'd_manager'],
+               columns='d_utm_source',
+               values='lead_id',
+               aggfunc='count',
+               fill_value=0,
+               margins=True)
+
+worksheet = sh_out.add_worksheet(title='Количество мусорных заявок', rows="100", cols="20")
+set_with_dataframe(worksheet, report_garbage_pivot, include_index=True, include_column_header=True)
+format_with_dataframe(worksheet, 
+                      report_garbage_pivot,
+                      include_column_header=True,
+                      include_index=True)
+
+#Создаем столбец - заявка от нового клиента (True/False)
+def is_new_client (client_id):
+    if (client_id in df_leads_prev['l_client_id'].values):
+        return False
+    elif (client_id in df_transactions_prev['l_client_id'].values):
+        return False
+    return True
+
+df_report['new_client'] = df_report.l_client_id.map(lambda p: is_new_client(p))
+
+#Строим отчет по заявкам от новых клиентов
+#Отправляем отчет в Google Sheets
+report_new_client_pivot = pd.pivot_table(df_report,
+               index=['d_club', 'd_manager'],
+               columns='d_utm_source',
+               values='new_client',
+               aggfunc='sum',
+               fill_value=0,
+               margins=True)
+
+worksheet = sh_out.add_worksheet(title='Количество новых заявок', rows="100", cols="20")
+set_with_dataframe(worksheet, report_new_client_pivot, include_index=True, include_column_header=True)
+format_with_dataframe(worksheet, 
+                      report_new_client_pivot,
+                      include_column_header=True,
+                      include_index=True)
+
+#Создаем столбец - покупатель (True/False)
+def is_buyer(row):
+    is_buyer_date_delta = row.date + dt.timedelta(days=7)
+    df_is_buyer = df_transactions[(df_transactions['date'] >= row.date) & (df_transactions['date'] < is_buyer_date_delta)]['l_client_id'].values
+    if (row.l_client_id in df_is_buyer):
+        return True
+    return False
+
+df_report['buyer'] = df_report.apply(is_buyer, axis='columns')
+
+#Создаем отчет по покупателям 
+#Отправляем в Google Sheets
+report_buyer_pivot = pd.pivot_table(df_report,
+               index=['d_club', 'd_manager'],
+               columns='d_utm_source',
+               values='buyer',
+               aggfunc='sum',
+               fill_value=0,
+               margins=True)
+
+worksheet = sh_out.add_worksheet(title='Количество покупателей', rows="100", cols="20")
+set_with_dataframe(worksheet, report_buyer_pivot, include_index=True, include_column_header=True)
+format_with_dataframe(worksheet, 
+                      report_buyer_pivot,
+                      include_column_header=True,
+                      include_index=True)
+
+№Создаем отчет по новым покупателям (явлеется одновременно и новым клиентом, и покупателем)
+#Отправляем в Google Sheets
+df_report_new_buyer = df_report.loc[(df_report['new_client'] == True) & (df_report['buyer'] == True)]
+
+report_new_buyer_pivot = pd.pivot_table(df_report_new_buyer,
+               index=['d_club', 'd_manager'],
+               columns='d_utm_source',
+               values='buyer',
+               aggfunc='sum',
+               fill_value=0,
+               margins=True)
+
+worksheet = sh_out.add_worksheet(title='Количество новых покупателей', rows="100", cols="20")
+set_with_dataframe(worksheet, report_new_buyer_pivot, include_index=True, include_column_header=True)
+format_with_dataframe(worksheet, 
+                      report_new_buyer_pivot,
+                      include_column_header=True,
+                      include_index=True)
+
+#Считаем сумму покупок по новым покупателям (создаем новый столбец)
+def new_buyer_total (client_id):
+    return df_transactions_curr[df_transactions_curr['l_client_id'] == client_id].m_real_amount.sum()
+
+df_report_new_buyer['new_buyer_total'] = df_report_new_buyer['l_client_id'].map(lambda p: new_buyer_total(p))
+
+#Удаляем нулевые строки (в таблице транзакций почему-то есть строки с нулевой суммой) и повторяющиеся значения
+#Строим отчет, отправляем в Google Sheets
+df_report_new_buyer_total = df_report_new_buyer[df_report_new_buyer['new_buyer_total'] > 0]
+df_report_new_buyer_total = df_report_new_buyer_total.drop_duplicates(subset=['l_client_id', 'new_buyer_total'], keep='first')
+
+report_new_buyer_total_pivot = pd.pivot_table(df_report_new_buyer_total,
+               index=['d_club', 'd_manager'],
+               columns='d_utm_source',
+               values='new_buyer_total',
+               aggfunc='sum',
+               fill_value=0,
+               margins=True)
+
+worksheet = sh_out.add_worksheet(title='Доход от покупок новых покупателей', rows="100", cols="20")
+set_with_dataframe(worksheet, report_new_buyer_total_pivot, include_index=True, include_column_header=True)
+format_with_dataframe(worksheet, 
+                      report_new_buyer_total_pivot,
+                      include_column_header=True,
+                      include_index=True)
