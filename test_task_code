@@ -182,7 +182,7 @@ df_report_new_buyer['new_buyer_total'] = df_report_new_buyer['l_client_id'].map(
 #Удаляем нулевые строки (в таблице транзакций почему-то есть строки с нулевой суммой) и повторяющиеся значения
 #Строим отчет, отправляем в Google Sheets
 df_report_new_buyer_total = df_report_new_buyer[df_report_new_buyer['new_buyer_total'] > 0]
-df_report_new_buyer_total = df_report_new_buyer_total.drop_duplicates(subset=['l_client_id', 'new_buyer_total'], keep='first')
+df_report_new_buyer_total = df_report_new_buyer_total.drop_duplicates(subset=['l_client_id'], keep='first')
 
 report_new_buyer_total_pivot = pd.pivot_table(df_report_new_buyer_total,
                index=['d_club', 'd_manager'],
